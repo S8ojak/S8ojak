@@ -68,6 +68,19 @@ def save_club(data):
     json.dump(data, open(CLUB_FILE, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 
 
+def is_member(user_id: int) -> bool:
+    """Return True if user is already in the club."""
+    return any(u.get("user_id") == user_id for u in load_club())
+
+
+def get_member(user_id: int):
+    """Return member record or None."""
+    for u in load_club():
+        if u.get("user_id") == user_id:
+            return u
+    return None
+
+
 # Global helpers
 order_map = {}
 order_count = 0
@@ -83,6 +96,20 @@ def main_menu() -> types.ReplyKeyboardMarkup:
     return kb
 
 
+def guest_menu() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("🐎 RIDNESS Club")
+    return kb
+
+
+async def require_membership(msg: types.Message):
+    """Notify user that a feature requires club membership."""
+    await msg.answer(
+        "Доступно только участникам RIDNESS Club.",
+        reply_markup=guest_menu(),
+    )
+
+
 def categories_kb(cat_list):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     for c in cat_list:
@@ -94,11 +121,18 @@ def categories_kb(cat_list):
 # Basic commands
 @dp.message_handler(commands="start")
 async def cmd_start(msg: types.Message):
-    await msg.answer(
-        "Добро пожаловать в <b>RIDNESS</b> — экипировка для самых требовательных всадников.\n"
-        "Выберите раздел 👇",
-        reply_markup=main_menu(),
-    )
+    if is_member(msg.from_user.id):
+        await msg.answer(
+            "Добро пожаловать в <b>RIDNESS</b> — экипировка для самых требовательных всадников.\n"
+            "Выберите раздел 👇",
+            reply_markup=main_menu(),
+        )
+    else:
+        await msg.answer(
+            "RIDNESS Club — экипировка для самых требовательных всадников.\n"
+            "Для доступа к каталогу и предзаказу вступите в клуб.",
+            reply_markup=guest_menu(),
+        )
 
 
 @dp.message_handler(commands="ping")
@@ -109,6 +143,9 @@ async def cmd_ping(msg: types.Message):
 # Новости
 @dp.message_handler(lambda m: m.text == "Новости")
 async def show_news(msg: types.Message):
+    if not is_member(msg.from_user.id):
+        await require_membership(msg)
+        return
     await msg.answer(
         "🔥 <b>Новости RIDNESS</b>\n"
         "• Новая коллекция уже доступна!\n"
@@ -121,6 +158,9 @@ async def show_news(msg: types.Message):
 # Каталог
 @dp.message_handler(lambda m: m.text == "Каталог")
 async def choose_category(msg: types.Message):
+    if not is_member(msg.from_user.id):
+        await require_membership(msg)
+        return
     catalog = load_catalog()
     if not catalog:
         await msg.answer("Каталог пока пуст 🚧", reply_markup=main_menu())
@@ -128,8 +168,19 @@ async def choose_category(msg: types.Message):
     await msg.answer("Выберите категорию:", reply_markup=categories_kb(catalog.keys()))
 
 
+@dp.message_handler(lambda m: m.text == "Предзаказ")
+async def preorder_from_menu(msg: types.Message):
+    if not is_member(msg.from_user.id):
+        await require_membership(msg)
+        return
+    await choose_category(msg)
+
+
 @dp.message_handler(lambda m: m.text and m.text in load_catalog())
 async def show_items(msg: types.Message):
+    if not is_member(msg.from_user.id):
+        await require_membership(msg)
+        return
     catalog = load_catalog()
     cat = msg.text
     items = catalog.get(cat, [])
@@ -164,14 +215,15 @@ async def show_items(msg: types.Message):
 
 # FSM предзаказ
 class PreOrder(StatesGroup):
-    name = State()
-    contact = State()
     qty = State()
     comment = State()
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("order:"))
 async def order_start(cb: types.CallbackQuery, state: FSMContext):
+    if not is_member(cb.from_user.id):
+        await cb.answer("Только для участников клуба", show_alert=True)
+        return
     key = cb.data.split(":", 1)[1]
     if key not in order_map:
         await cb.answer("Ошибка товара", show_alert=True)
@@ -179,9 +231,14 @@ async def order_start(cb: types.CallbackQuery, state: FSMContext):
     cat, idx = order_map[key]
     catalog = load_catalog()
     item = catalog[cat][idx]
-    await state.update_data(item=item["name"])
-    await bot.send_message(cb.from_user.id, "Ваше имя (или Отмена):")
-    await PreOrder.name.set()
+    member = get_member(cb.from_user.id) or {}
+    await state.update_data(
+        item=item["name"],
+        name=member.get("name", ""),
+        contact=member.get("phone") or member.get("email", ""),
+    )
+    await bot.send_message(cb.from_user.id, "Количество:")
+    await PreOrder.qty.set()
     await cb.answer()
 
 
@@ -189,34 +246,6 @@ async def order_start(cb: types.CallbackQuery, state: FSMContext):
 
 def is_cancel(msg):
     return msg.text and msg.text.lower() == "отмена"
-
-
-@dp.message_handler(state=PreOrder.name)
-async def po_contact(msg: types.Message, state: FSMContext):
-    if is_cancel(msg):
-        await state.finish()
-        await msg.answer("Отменено.", reply_markup=main_menu())
-        return
-    await state.update_data(name=msg.text)
-    await msg.answer(
-        "Телефон или Email:",
-        reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("Отмена"),
-    )
-    await PreOrder.contact.set()
-
-
-@dp.message_handler(state=PreOrder.contact)
-async def po_qty(msg: types.Message, state: FSMContext):
-    if is_cancel(msg):
-        await state.finish()
-        await msg.answer("Отменено.", reply_markup=main_menu())
-        return
-    await state.update_data(contact=msg.text)
-    await msg.answer(
-        "Количество:",
-        reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("Отмена"),
-    )
-    await PreOrder.qty.set()
 
 
 @dp.message_handler(state=PreOrder.qty)
@@ -260,6 +289,9 @@ async def po_finish(msg: types.Message, state: FSMContext):
 # Контакты
 @dp.message_handler(lambda m: m.text == "Контакты")
 async def show_contacts(msg: types.Message):
+    if not is_member(msg.from_user.id):
+        await require_membership(msg)
+        return
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
         types.InlineKeyboardButton("📞 Телефон", callback_data="copy_phone"),
@@ -285,6 +317,9 @@ async def copy_phone(cb: types.CallbackQuery):
 # Адреса
 @dp.message_handler(lambda m: m.text == "Адреса")
 async def show_addresses(msg: types.Message):
+    if not is_member(msg.from_user.id):
+        await require_membership(msg)
+        return
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
         types.InlineKeyboardButton("КСК Прованс", url="https://yandex.com/maps/-/CHGVqL90"),
@@ -421,7 +456,8 @@ async def cmd_add_sale(msg: types.Message):
 # Unknown handler
 @dp.message_handler()
 async def unknown(msg: types.Message):
-    await msg.answer("Выберите действие из меню 👇", reply_markup=main_menu())
+    kb = main_menu() if is_member(msg.from_user.id) else guest_menu()
+    await msg.answer("Выберите действие из меню 👇", reply_markup=kb)
 
 
 # Bot runner
