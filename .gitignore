@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.log
+.env
+club_members.json
+catalog.json
